@@ -1,0 +1,978 @@
+#!/usr/bin/env python3
+import curses
+import os
+import re
+import shutil
+import subprocess
+from datetime import datetime, timezone
+from collections import defaultdict
+
+def run(cmd):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        return {
+            "returncode": p.returncode,
+            "stdout": (p.stdout or "").strip(),
+            "stderr": (p.stderr or "").strip(),
+        }
+    except FileNotFoundError:
+        return {"returncode": 127, "stdout": "", "stderr": "command not found"}
+
+def parse_ufw(stdout):
+    info = {"status": "N/A", "logging": "N/A", "default": "N/A", "rules_count": 0}
+    m = re.search(r"^Status:\s*(.+)$", stdout, re.M)
+    if m:
+        info["status"] = m.group(1).strip()
+    m = re.search(r"^Logging:\s*(.+)$", stdout, re.M)
+    if m:
+        info["logging"] = m.group(1).strip()
+    m = re.search(r"^Default:\s*(.+)$", stdout, re.M)
+    if m:
+        info["default"] = m.group(1).strip()
+    
+    lines = stdout.splitlines()
+    in_rules = False
+    for line in lines:
+        if "---" in line or ("To" in line and "Action" in line):
+            in_rules = True
+            continue
+        if in_rules and line.strip() and not line.startswith("Status") and not line.startswith("Logging"):
+            info["rules_count"] += 1
+    
+    return info
+
+def parse_iptables_S(stdout):
+    policies = {}
+    rule_count = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("-P "):
+            parts = line.split()
+            if len(parts) >= 3:
+                policies[parts[1]] = parts[2]
+        elif line.startswith("-A "):
+            rule_count += 1
+    return {"policies": policies, "rule_count": rule_count}
+
+def get_listening_ports():
+    """Récupère les ports en écoute avec ss ou netstat"""
+    ports = []
+    
+    if shutil.which("ss"):
+        r = run(["ss", "-tulnp"])
+        if r["returncode"] == 0:
+            for line in r["stdout"].splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 5:
+                    proto = parts[0]
+                    local_addr = parts[4]
+                    process = ""
+                    if len(parts) >= 7:
+                        process = parts[6]
+                    ports.append({
+                        "proto": proto,
+                        "local": local_addr,
+                        "process": process
+                    })
+    elif shutil.which("netstat"):
+        r = run(["netstat", "-tulnp"])
+        if r["returncode"] == 0:
+            for line in r["stdout"].splitlines():
+                if "LISTEN" in line or "udp" in line.lower():
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        proto = parts[0]
+                        local_addr = parts[3]
+                        process = parts[-1] if len(parts) >= 7 else ""
+                        ports.append({
+                            "proto": proto,
+                            "local": local_addr,
+                            "process": process
+                        })
+    
+    return ports
+
+def get_network_processes():
+    """Récupère les processus avec connexions réseau actives via lsof"""
+    processes = []
+    
+    if shutil.which("lsof"):
+        r = run(["lsof", "-i", "-n", "-P"])
+        if r["returncode"] == 0:
+            for line in r["stdout"].splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 9:
+                    processes.append({
+                        "command": parts[0],
+                        "pid": parts[1],
+                        "user": parts[2],
+                        "type": parts[7],
+                        "name": parts[8]
+                    })
+    
+    return processes
+
+def get_disk_info():
+    """Récupère les informations sur les disques et partitions"""
+    disks = {
+        "partitions": [],
+        "filesystems": [],
+        "block_devices": []
+    }
+    
+    # df - filesystem usage
+    if shutil.which("df"):
+        r = run(["df", "-h", "-T"])
+        if r["returncode"] == 0:
+            for line in r["stdout"].splitlines()[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) >= 7:
+                    # Skip tmpfs, devtmpfs, etc. for clarity
+                    if parts[1] in ["tmpfs", "devtmpfs", "squashfs"]:
+                        continue
+                    
+                    usage_str = parts[5].replace('%', '')
+                    try:
+                        usage_pct = int(usage_str)
+                    except:
+                        usage_pct = 0
+                    
+                    disks["filesystems"].append({
+                        "device": parts[0],
+                        "type": parts[1],
+                        "size": parts[2],
+                        "used": parts[3],
+                        "avail": parts[4],
+                        "use_pct": usage_pct,
+                        "mounted": parts[6]
+                    })
+    
+    # lsblk - block devices and partitions
+    if shutil.which("lsblk"):
+        r = run(["lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL"])
+        if r["returncode"] == 0:
+            for line in r["stdout"].splitlines()[1:]:  # Skip header
+                disks["block_devices"].append(line.strip())
+    
+    # fdisk -l for partition table info (requires root)
+    if shutil.which("fdisk") and os.geteuid() == 0:
+        r = run(["fdisk", "-l"])
+        if r["returncode"] == 0:
+            current_disk = None
+            for line in r["stdout"].splitlines():
+                if line.startswith("Disk /dev/"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        current_disk = {
+                            "device": parts[1].rstrip(':'),
+                            "size": " ".join(parts[2:4]),
+                            "partitions": []
+                        }
+                        disks["partitions"].append(current_disk)
+                elif current_disk and line.startswith("/dev/"):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        current_disk["partitions"].append({
+                            "device": parts[0],
+                            "boot": "*" in parts[1],
+                            "size": parts[3] if len(parts) > 3 else "N/A"
+                        })
+    
+    return disks
+
+def get_process_details(pid):
+    """Récupère les détails d'un processus"""
+    details = {
+        "pid": pid,
+        "cmdline": "N/A",
+        "exe": "N/A",
+        "cwd": "N/A",
+        "exists": False
+    }
+    
+    proc_path = f"/proc/{pid}"
+    if not os.path.exists(proc_path):
+        return details
+    
+    details["exists"] = True
+    
+    try:
+        with open(f"{proc_path}/cmdline", "r") as f:
+            cmdline = f.read().replace('\0', ' ').strip()
+            details["cmdline"] = cmdline if cmdline else "N/A"
+    except:
+        pass
+    
+    try:
+        details["exe"] = os.readlink(f"{proc_path}/exe")
+    except:
+        pass
+    
+    try:
+        details["cwd"] = os.readlink(f"{proc_path}/cwd")
+    except:
+        pass
+    
+    return details
+
+def analyze_suspicious_processes(processes):
+    """Analyse les processus et détecte les suspects"""
+    suspicious = []
+    seen_pids = set()
+    
+    by_command = defaultdict(list)
+    for p in processes:
+        by_command[p["command"]].append(p)
+    
+    for command, procs in by_command.items():
+        for proc in procs:
+            pid = proc["pid"]
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            
+            risk_score = 0
+            reasons = []
+            
+            if proc["user"] == "root":
+                risk_score += 10
+                reasons.append("Running as root")
+            
+            if "python" in command.lower():
+                risk_score += 5
+                reasons.append("Python script")
+                details = get_process_details(pid)
+                if "security" in details["cmdline"].lower():
+                    risk_score += 20
+                    reasons.append("Security-related name")
+            
+            if "0.0.0.0" in proc.get("name", "") or "::" in proc.get("name", ""):
+                risk_score += 15
+                reasons.append("Publicly exposed")
+            
+            if proc.get("type") == "TCP":
+                risk_score += 5
+            
+            if risk_score >= 15:
+                suspicious.append({
+                    "process": proc,
+                    "risk_score": risk_score,
+                    "reasons": reasons,
+                    "details": get_process_details(pid)
+                })
+    
+    return sorted(suspicious, key=lambda x: x["risk_score"], reverse=True)
+
+def get_service_suggestions():
+    """Suggère des services à désactiver"""
+    suggestions = []
+    
+    r = run(["systemctl", "is-active", "avahi-daemon"])
+    if r["stdout"] == "active":
+        suggestions.append({
+            "service": "avahi-daemon",
+            "reason": "mDNS service (sauf si réseau local avec .local)",
+            "impact": "Moyen",
+            "command": "sudo systemctl stop avahi-daemon && sudo systemctl disable avahi-daemon"
+        })
+    
+    r = run(["systemctl", "is-active", "cups"])
+    if r["stdout"] == "active":
+        suggestions.append({
+            "service": "cups",
+            "reason": "Serveur d'impression (sauf si imprimante)",
+            "impact": "Faible",
+            "command": "sudo systemctl stop cups && sudo systemctl disable cups"
+        })
+    
+    r = run(["systemctl", "is-active", "bluetooth"])
+    if r["stdout"] == "active":
+        suggestions.append({
+            "service": "bluetooth",
+            "reason": "Bluetooth (sauf si périphériques BT)",
+            "impact": "Faible",
+            "command": "sudo systemctl stop bluetooth && sudo systemctl disable bluetooth"
+        })
+    
+    r = run(["systemctl", "is-active", "wsdd"])
+    if r["stdout"] == "active":
+        suggestions.append({
+            "service": "wsdd",
+            "reason": "Windows discovery (sauf partage SMB)",
+            "impact": "Faible",
+            "command": "sudo systemctl stop wsdd && sudo systemctl disable wsdd"
+        })
+    
+    return suggestions
+
+def calculate_criticality(data):
+    """Calcule le niveau de criticité global"""
+    score = 0
+    issues = []
+    
+    ufw = data.get("ufw", {})
+    if ufw.get("installed") is False:
+        score += 30
+        issues.append("UFW non installé")
+    elif ufw.get("status", "").lower() == "inactive":
+        score += 40
+        issues.append("UFW inactif")
+    elif "error" in ufw:
+        score += 20
+        issues.append("UFW non accessible")
+    
+    if "deny" not in ufw.get("default", "").lower() and ufw.get("status", "").lower() != "n/a":
+        score += 15
+        issues.append("UFW default policy pas en deny")
+    
+    ports = data.get("listening_ports", [])
+    exposed_count = len([p for p in ports if "0.0.0.0" in p.get("local", "") or "::" in p.get("local", "")])
+    if exposed_count > 10:
+        score += 25
+        issues.append(f"{exposed_count} ports exposés publiquement")
+    elif exposed_count > 5:
+        score += 15
+        issues.append(f"{exposed_count} ports exposés")
+    
+    net_procs = data.get("network_processes", [])
+    if len(net_procs) > 30:
+        score += 10
+        issues.append(f"{len(net_procs)} processus réseau actifs")
+    
+    suspicious = data.get("suspicious_processes", [])
+    high_risk = [s for s in suspicious if s["risk_score"] >= 30]
+    if high_risk:
+        score += 20
+        issues.append(f"{len(high_risk)} processus à haut risque")
+    
+    # Disk usage warnings
+    disks = data.get("disk_info", {})
+    filesystems = disks.get("filesystems", [])
+    critical_disks = [f for f in filesystems if f["use_pct"] >= 90]
+    warning_disks = [f for f in filesystems if 80 <= f["use_pct"] < 90]
+    
+    if critical_disks:
+        score += 15
+        issues.append(f"{len(critical_disks)} disque(s) >90% pleins")
+    elif warning_disks:
+        score += 5
+        issues.append(f"{len(warning_disks)} disque(s) >80% pleins")
+    
+    if score >= 50:
+        level = "CRITIQUE"
+        color = 3
+    elif score >= 30:
+        level = "MOYEN"
+        color = 4
+    else:
+        level = "BON"
+        color = 2
+    
+    return {
+        "score": score,
+        "level": level,
+        "color": color,
+        "issues": issues
+    }
+
+def collect_firewall_data():
+    is_root = (os.geteuid() == 0)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    data = {
+        "is_root": is_root,
+        "timestamp": timestamp,
+        "ufw": {},
+        "nft": {},
+        "iptables_v4": {},
+        "iptables_v6": {},
+        "listening_ports": [],
+        "network_processes": [],
+        "suspicious_processes": [],
+        "service_suggestions": [],
+        "disk_info": {},
+        "hints": []
+    }
+    
+    # UFW
+    if shutil.which("ufw"):
+        r = run(["ufw", "status", "verbose"])
+        if r["returncode"] == 0:
+            data["ufw"] = parse_ufw(r["stdout"])
+        else:
+            data["ufw"] = {"error": r["stderr"] or "Erreur"}
+            if not is_root:
+                data["hints"].append("Lance avec sudo pour UFW")
+    else:
+        data["ufw"] = {"installed": False}
+    
+    # nftables
+    if shutil.which("nft"):
+        r = run(["nft", "list", "ruleset"])
+        if r["returncode"] == 0:
+            lines = r["stdout"].splitlines()
+            data["nft"] = {
+                "ruleset_present": len(r["stdout"].strip()) > 0,
+                "line_count": len(lines)
+            }
+        else:
+            data["nft"] = {"error": r["stderr"] or "Erreur"}
+            if not is_root:
+                data["hints"].append("Lance avec sudo pour nftables")
+    else:
+        data["nft"] = {"installed": False}
+    
+    # iptables v4
+    if shutil.which("iptables"):
+        r = run(["iptables", "-S"])
+        if r["returncode"] == 0:
+            data["iptables_v4"] = parse_iptables_S(r["stdout"])
+        else:
+            data["iptables_v4"] = {"error": r["stderr"] or "Erreur"}
+            if not is_root:
+                data["hints"].append("Lance avec sudo pour iptables")
+    else:
+        data["iptables_v4"] = {"installed": False}
+    
+    # iptables v6
+    if shutil.which("ip6tables"):
+        r = run(["ip6tables", "-S"])
+        if r["returncode"] == 0:
+            data["iptables_v6"] = parse_iptables_S(r["stdout"])
+        else:
+            data["iptables_v6"] = {"error": r["stderr"] or "Erreur"}
+    else:
+        data["iptables_v6"] = {"installed": False}
+    
+    # Listening ports
+    data["listening_ports"] = get_listening_ports()
+    
+    # Network processes
+    data["network_processes"] = get_network_processes()
+    
+    # Suspicious processes
+    data["suspicious_processes"] = analyze_suspicious_processes(data["network_processes"])
+    
+    # Service suggestions
+    data["service_suggestions"] = get_service_suggestions()
+    
+    # Disk info
+    data["disk_info"] = get_disk_info()
+    
+    # Criticité
+    data["criticality"] = calculate_criticality(data)
+    
+    return data
+
+def draw_tab_bar(stdscr, width, current_tab):
+    tabs = ["Firewall", "Ports", "Processus", "Monitoring", "Disques"]
+    tab_width = width // len(tabs)
+    
+    y = 2
+    for i, tab in enumerate(tabs):
+        x = i * tab_width
+        if i == current_tab:
+            stdscr.addstr(y, x, f" [{tab}] ", curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE)
+        else:
+            stdscr.addstr(y, x, f"  {tab}  ", curses.color_pair(5))
+
+def draw_firewall_tab(stdscr, data, start_y, height, width, scroll):
+    y = start_y
+    line_count = 0
+    
+    # UFW
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, "--- UFW ---", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    ufw = data['ufw']
+    ufw_lines = []
+    if ufw.get("installed") is False:
+        ufw_lines.append(("Non installé", 3))
+    elif "error" in ufw:
+        ufw_lines.append((f"Erreur: {ufw['error']}", 3))
+    else:
+        ufw_lines.append((f"Status: {ufw.get('status', 'N/A')}", 2 if ufw.get('status', '').lower() == 'active' else 3))
+        ufw_lines.append((f"Logging: {ufw.get('logging', 'N/A')}", 5))
+        ufw_lines.append((f"Default: {ufw.get('default', 'N/A')}", 5))
+        ufw_lines.append((f"Règles: {ufw.get('rules_count', 0)}", 5))
+    
+    for text, color in ufw_lines:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, text[:width-6], curses.color_pair(color))
+            y += 1
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    # nftables
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, "--- nftables ---", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    nft = data['nft']
+    nft_lines = []
+    if nft.get("installed") is False:
+        nft_lines.append(("Non installé", 3))
+    elif "error" in nft:
+        nft_lines.append((f"Erreur: {nft['error']}", 3))
+    else:
+        present = "Oui" if nft.get("ruleset_present") else "Non"
+        nft_lines.append((f"Ruleset présent: {present}", 2 if nft.get("ruleset_present") else 4))
+        nft_lines.append((f"Lignes: {nft.get('line_count', 0)}", 5))
+    
+    for text, color in nft_lines:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, text[:width-6], curses.color_pair(color))
+            y += 1
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    # iptables v4
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, "--- iptables (v4) ---", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    ipt = data['iptables_v4']
+    ipt_lines = []
+    if ipt.get("installed") is False:
+        ipt_lines.append(("Non installé", 3))
+    elif "error" in ipt:
+        ipt_lines.append((f"Erreur: {ipt['error']}", 3))
+    else:
+        policies = ipt.get("policies", {})
+        if policies:
+            pol_str = ", ".join(f"{k}={v}" for k, v in policies.items())
+            ipt_lines.append((f"Policies: {pol_str}", 5))
+        ipt_lines.append((f"Règles: {ipt.get('rule_count', 0)}", 5))
+    
+    for text, color in ipt_lines:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, text[:width-6], curses.color_pair(color))
+            y += 1
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    # iptables v6
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, "--- iptables (v6) ---", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    ipt6 = data['iptables_v6']
+    ipt6_lines = []
+    if ipt6.get("installed") is False:
+        ipt6_lines.append(("Non installé", 3))
+    elif "error" in ipt6:
+        ipt6_lines.append((f"Erreur: {ipt6['error']}", 3))
+    else:
+        policies = ipt6.get("policies", {})
+        if policies:
+            pol_str = ", ".join(f"{k}={v}" for k, v in policies.items())
+            ipt6_lines.append((f"Policies: {pol_str}", 5))
+        ipt6_lines.append((f"Règles: {ipt6.get('rule_count', 0)}", 5))
+    
+    for text, color in ipt6_lines:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, text[:width-6], curses.color_pair(color))
+            y += 1
+        line_count += 1
+    
+    return line_count
+
+def draw_ports_tab(stdscr, data, start_y, height, width, scroll):
+    y = start_y
+    line_count = 0
+    
+    ports = data.get("listening_ports", [])
+    
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, f"Ports en écoute: {len(ports)}", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        header = f"{'Proto':<8} {'Adresse locale':<30} {'Processus':<30}"
+        stdscr.addstr(y, 2, header[:width-4], curses.color_pair(5) | curses.A_UNDERLINE)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    for port in ports:
+        proto = port.get("proto", "")[:7]
+        local = port.get("local", "")[:29]
+        process = port.get("process", "")[:29]
+        
+        color = 5
+        if "0.0.0.0" in local or "::" in local:
+            color = 4
+        
+        line = f"{proto:<8} {local:<30} {process:<30}"
+        
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 2, line[:width-4], curses.color_pair(color))
+            y += 1
+        line_count += 1
+    
+    if not ports:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, "Aucun port en écoute détecté", curses.color_pair(4))
+            y += 1
+        line_count += 1
+    
+    return line_count
+
+def draw_processes_tab(stdscr, data, start_y, height, width, scroll):
+    y = start_y
+    line_count = 0
+    
+    procs = data.get("network_processes", [])
+    
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, f"Processus réseau actifs: {len(procs)}", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        header = f"{'PID':<8} {'User':<12} {'Command':<20} {'Type':<10} {'Connexion':<30}"
+        stdscr.addstr(y, 2, header[:width-4], curses.color_pair(5) | curses.A_UNDERLINE)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    for proc in procs:
+        pid = proc.get("pid", "")[:7]
+        user = proc.get("user", "")[:11]
+        cmd = proc.get("command", "")[:19]
+        ptype = proc.get("type", "")[:9]
+        name = proc.get("name", "")[:29]
+        
+        line = f"{pid:<8} {user:<12} {cmd:<20} {ptype:<10} {name:<30}"
+        
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 2, line[:width-4], curses.color_pair(5))
+            y += 1
+        line_count += 1
+    
+    if not procs:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, "Aucun processus réseau détecté", curses.color_pair(4))
+            y += 1
+        line_count += 1
+    
+    return line_count
+
+def draw_monitoring_tab(stdscr, data, start_y, height, width, scroll):
+    y = start_y
+    line_count = 0
+    
+    suspicious = data.get("suspicious_processes", [])
+    suggestions = data.get("service_suggestions", [])
+    
+    # Processus suspects
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, f"Processus suspects: {len(suspicious)}", curses.color_pair(3) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    if suspicious:
+        for susp in suspicious[:10]:
+            proc = susp["process"]
+            risk = susp["risk_score"]
+            reasons = ", ".join(susp["reasons"])
+            details = susp["details"]
+            
+            color = 3 if risk >= 30 else 4
+            
+            if line_count >= scroll and y < height - 2:
+                line = f"  [Risk:{risk}] PID:{proc['pid']} {proc['command']} ({proc['user']})"
+                stdscr.addstr(y, 2, line[:width-4], curses.color_pair(color) | curses.A_BOLD)
+                y += 1
+                line_count += 1
+            else:
+                line_count += 1
+            
+            if line_count >= scroll and y < height - 2:
+                stdscr.addstr(y, 4, f"Reasons: {reasons}"[:width-6], curses.color_pair(5))
+                y += 1
+                line_count += 1
+            else:
+                line_count += 1
+            
+            if details["exists"] and details["cmdline"] != "N/A":
+                if line_count >= scroll and y < height - 2:
+                    stdscr.addstr(y, 4, f"Cmd: {details['cmdline']}"[:width-6], curses.color_pair(5))
+                    y += 1
+                    line_count += 1
+                else:
+                    line_count += 1
+            
+            if line_count >= scroll and y < height - 2:
+                y += 1
+                line_count += 1
+            else:
+                line_count += 1
+    else:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, "Aucun processus suspect détecté", curses.color_pair(2))
+            y += 1
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    # Service suggestions
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, f"Services à désactiver: {len(suggestions)}", curses.color_pair(4) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    if suggestions:
+        for sug in suggestions:
+            if line_count >= scroll and y < height - 2:
+                line = f"  [{sug['impact']}] {sug['service']}: {sug['reason']}"
+                stdscr.addstr(y, 2, line[:width-4], curses.color_pair(4))
+                y += 1
+                line_count += 1
+            else:
+                line_count += 1
+            
+            if line_count >= scroll and y < height - 2:
+                stdscr.addstr(y, 4, f"Cmd: {sug['command']}"[:width-6], curses.color_pair(5))
+                y += 1
+                line_count += 1
+            else:
+                line_count += 1
+            
+            if line_count >= scroll and y < height - 2:
+                y += 1
+                line_count += 1
+            else:
+                line_count += 1
+    else:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, "Aucune suggestion", curses.color_pair(2))
+            y += 1
+        line_count += 1
+    
+    return line_count
+
+def draw_disks_tab(stdscr, data, start_y, height, width, scroll):
+    y = start_y
+    line_count = 0
+    
+    disk_info = data.get("disk_info", {})
+    filesystems = disk_info.get("filesystems", [])
+    block_devices = disk_info.get("block_devices", [])
+    
+    # Filesystems
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, f"Systèmes de fichiers: {len(filesystems)}", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        header = f"{'Device':<20} {'Type':<8} {'Size':<8} {'Used':<8} {'Avail':<8} {'Use%':<6} {'Mounted':<20}"
+        stdscr.addstr(y, 2, header[:width-4], curses.color_pair(5) | curses.A_UNDERLINE)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    for fs in filesystems:
+        device = fs["device"][:19]
+        fstype = fs["type"][:7]
+        size = fs["size"][:7]
+        used = fs["used"][:7]
+        avail = fs["avail"][:7]
+        use_pct = fs["use_pct"]
+        mounted = fs["mounted"][:19]
+        
+        # Color based on usage
+        if use_pct >= 90:
+            color = 3  # Red
+        elif use_pct >= 80:
+            color = 4  # Yellow
+        else:
+            color = 5  # White
+        
+        line = f"{device:<20} {fstype:<8} {size:<8} {used:<8} {avail:<8} {use_pct:<6}% {mounted:<20}"
+        
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 2, line[:width-4], curses.color_pair(color))
+            y += 1
+        line_count += 1
+    
+    if not filesystems:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, "Aucun système de fichiers détecté", curses.color_pair(4))
+            y += 1
+        line_count += 1
+    
+    if line_count >= scroll and y < height - 2:
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    # Block devices
+    if line_count >= scroll and y < height - 2:
+        stdscr.addstr(y, 2, "Périphériques bloc (lsblk):", curses.color_pair(1) | curses.A_BOLD)
+        y += 1
+        line_count += 1
+    else:
+        line_count += 1
+    
+    for bd in block_devices:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 2, bd[:width-4], curses.color_pair(5))
+            y += 1
+        line_count += 1
+    
+    if not block_devices:
+        if line_count >= scroll and y < height - 2:
+            stdscr.addstr(y, 4, "lsblk non disponible", curses.color_pair(4))
+            y += 1
+        line_count += 1
+    
+    return line_count
+
+def draw_ui(stdscr, data, current_tab, scroll):
+    stdscr.clear()
+    height, width = stdscr.getmaxyx()
+    
+    y = 0
+    
+    # Header
+    title = "=== FIREWALL AUDIT UBUNTU ==="
+    stdscr.addstr(y, (width - len(title)) // 2, title, curses.color_pair(1) | curses.A_BOLD)
+    y += 1
+    
+    # Criticité
+    crit = data.get("criticality", {})
+    crit_text = f"Criticité: {crit.get('level', 'N/A')} (Score: {crit.get('score', 0)})"
+    stdscr.addstr(y, 2, crit_text, curses.color_pair(crit.get('color', 5)) | curses.A_BOLD)
+    
+    root_status = "✓ Root" if data['is_root'] else "✗ Non-root"
+    root_color = curses.color_pair(2) if data['is_root'] else curses.color_pair(4)
+    stdscr.addstr(y, width - len(root_status) - 2, root_status, root_color)
+    y += 1
+    
+    # Tab bar
+    draw_tab_bar(stdscr, width, current_tab)
+    y += 2
+    
+    # Issues (only on firewall tab)
+    issues = crit.get("issues", [])
+    if issues and current_tab == 0:
+        stdscr.addstr(y, 2, "Issues:", curses.color_pair(4) | curses.A_BOLD)
+        y += 1
+        for issue in issues[:3]:
+            if y < height - 2:
+                stdscr.addstr(y, 4, f"• {issue}"[:width-6], curses.color_pair(4))
+                y += 1
+        y += 1
+    
+    # Tab content
+    start_y = y
+    if current_tab == 0:
+        total_lines = draw_firewall_tab(stdscr, data, start_y, height, width, scroll)
+    elif current_tab == 1:
+        total_lines = draw_ports_tab(stdscr, data, start_y, height, width, scroll)
+    elif current_tab == 2:
+        total_lines = draw_processes_tab(stdscr, data, start_y, height, width, scroll)
+    elif current_tab == 3:
+        total_lines = draw_monitoring_tab(stdscr, data, start_y, height, width, scroll)
+    else:
+        total_lines = draw_disks_tab(stdscr, data, start_y, height, width, scroll)
+    
+    # Footer
+    footer = "Tab: Changer onglet | ↑↓: Scroll | r: Refresh | q: Quit"
+    stdscr.addstr(height - 1, (width - len(footer)) // 2, footer, curses.color_pair(1))
+    
+    stdscr.refresh()
+    return total_lines
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    stdscr.timeout(100)
+    
+    # Initialize colors
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    
+    data = collect_firewall_data()
+    current_tab = 0
+    scroll = 0
+    total_lines = 0
+    
+    while True:
+        total_lines = draw_ui(stdscr, data, current_tab, scroll)
+        
+        try:
+            key = stdscr.getkey()
+            
+            if key.lower() == 'q':
+                break
+            elif key.lower() == 'r':
+                data = collect_firewall_data()
+                scroll = 0
+            elif key == '\t' or key.lower() == 't':
+                current_tab = (current_tab + 1) % 5
+                scroll = 0
+            elif key == 'KEY_UP':
+                scroll = max(0, scroll - 1)
+            elif key == 'KEY_DOWN':
+                height, _ = stdscr.getmaxyx()
+                max_scroll = max(0, total_lines - (height - 10))
+                scroll = min(max_scroll, scroll + 1)
+        except:
+            pass
+
+if __name__ == "__main__":
+    curses.wrapper(main)
+
