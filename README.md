@@ -31,7 +31,7 @@ This script uses only the Python 3 standard library. However, it relies on stand
 Clone the repository and make the script executable. No `pip install` or external dependencies are required.
 
 ```bash
-git clone https://github.com/your-username/SecTUI.git
+git clone https://github.com/MinouDu34/SecTUI.git
 cd SecTUI
 chmod +x sectui
 ```
