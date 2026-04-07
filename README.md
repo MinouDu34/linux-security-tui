@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3](https://img.shields.io/badge/python-3-blue.svg)](https://www.python.org/)
 
-**SecTUI** (or *Linux Security TUI*) is a zero-dependency, interactive terminal dashboard (TUI) designed for quick and efficient Linux server security auditing. 
+**SecTUI** (Security TUI) is a zero-dependency, interactive terminal dashboard designed for quick and efficient Linux server security auditing. 
 
-Built entirely with standard Python libraries (`curses`), it instantly consolidates critical information regarding your firewall, exposed ports, active network processes, and disk usage, making it the perfect tool for initial server assessments and quick-wins in DevSecOps.
+Built entirely with standard Python libraries (`curses`), it instantly consolidates critical information regarding your firewall, exposed ports, active network processes, and disk usage. It is the perfect standalone tool for initial server assessments and quick-wins in DevSecOps.
 
 ## ✨ Features
 
@@ -28,18 +28,18 @@ This script uses only the Python 3 standard library. However, it relies on stand
 
 ## 🚀 Installation & Usage
 
-Clone the repository and make the script executable. No `pip install` is required.
+Clone the repository and make the script executable. No `pip install` or external dependencies are required.
 
 ```bash
 git clone https://github.com/your-username/SecTUI.git
 cd SecTUI
-chmod +x audit.py
+chmod +x sectui
 ```
 
-Run the auditor:
+Run the auditor directly as a native command:
 
 ```bash
-sudo ./audit.py
+sudo ./sectui
 ```
 
 ## ⌨️ Navigation
